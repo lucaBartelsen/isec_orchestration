@@ -3,6 +3,7 @@ This script loads configuration settings from a config file and uses them to ini
 group scan, deploy patches, and shut down machines.
 """
 
+import socket
 import time
 import requests
 import configparser
@@ -26,6 +27,9 @@ scan_template = None
 machine_group_server = None
 machine_group_database = None
 deployment_template = None
+vcenter_server = None
+vcenter_username = None
+vcenter_password = None
 
 
 def load_config():
@@ -33,7 +37,7 @@ def load_config():
     This function loads configuration settings from a config file and sets them as global variables.
     """
     # define variables as global
-    global server, first_ring_id, second_ring_id, auth, verify, run_as_credentials, scan_template, machine_group_database, machine_group_server, deployment_template
+    global server, first_ring_id, second_ring_id, auth, verify, run_as_credentials, scan_template, machine_group_database, machine_group_server, deployment_template, vcenter_password, vcenter_server, vcenter_username
     # Create a ConfigParser object
     config = configparser.ConfigParser()
     # Read the config file
@@ -41,10 +45,9 @@ def load_config():
 
     # Get the server variable from the [Server] section
     server = config.get('Server', 'server')
-    # Get the first_ring_id variable from the [Server] section
-    first_ring_id = config.getint('Server', 'first_ring_id')
-    # Get the second_ring_id variable from the [Server] section
-    second_ring_id = config.getint('Server', 'second_ring_id')
+    vcenter_username = config.get('Server', 'vcenter_username')
+    vcenter_password = config.get('Server', 'vcenter_password')
+    vcenter_username = config.get('Server', 'vcenter_username')
 
     auth = HTTPKerberosAuth(mutual_authentication=OPTIONAL)
     verify = config.get('Server', 'path_to_cert')
@@ -160,7 +163,6 @@ def get_id_by_name(api_endpoint, name):
     logging.info(f"Getting the {api_endpoint} id for the {name} {api_endpoint}")
     log(response)
 
-    # looking for the patch uid
     py_obj = response.json()
     for item in py_obj["value"]:
         if item["name"] == name:
@@ -310,7 +312,8 @@ def get_patch_deployment_machines(id):
     py_obj = response.json()
     ret = []
     for item in py_obj['value']:
-        ret.append(item['address'])
+        obj = {"machine_name": item["name"], "ip_address": item["address"]}
+        ret.append(obj)
     return ret
 
 def shutdown(ip, reboot):
@@ -332,7 +335,7 @@ def shutdown(ip, reboot):
 
     return result
 
-def wait_for_shutdown(deployment_id, reboot_behaivior=False):
+def wait_for_shutdown(deployment_server_machines, deployment_id, reboot_behaivior=False):
     """
     This function waits for a patch deployment to finish and then shuts down the deployment server
     machines.
@@ -342,7 +345,6 @@ def wait_for_shutdown(deployment_id, reboot_behaivior=False):
     after the patch deployment is complete. If set to True, the machines will be rebooted. If set to
     False, the machines will not be rebooted, defaults to False (optional)
     """
-    deployment_server_machines = get_patch_deployment_machines(deployment_id)
     desired_status = "Succeeded"
 
     while True:
@@ -356,7 +358,61 @@ def wait_for_shutdown(deployment_id, reboot_behaivior=False):
         logging.info(f"Waiting 30 seconds until continuing to check if the operation finished")
     
     for machine in deployment_server_machines:
-        shutdown(machine, reboot_behaivior)
+        shutdown(machine["ip_address"], reboot_behaivior)
+
+def check_sql_server(ip):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.connect((ip, 1434))
+        s.close()
+        return True
+    except:
+        return False
+    
+def start_server(server_machines, database_machines):
+    """
+    The function starts virtual machines on a vCenter server and checks if SQL servers are running on a
+    list of database machines.
+    
+    :param server_machines: A list of dictionaries containing information about the server machines to
+    be started. Each dictionary contains the machine name and other relevant details
+    :param database_machines: A list of dictionaries containing information about the database machines,
+    including their IP addresses
+    """
+    login_url = f'{vcenter_server}/rest/com/vmware/cis/session'
+    login_data = {'username': vcenter_username, 'password': vcenter_password}
+    headers = {'Content-type': 'application/json'}
+    response = requests.post(login_url, data=json.dumps(login_data), headers=headers, verify=False)
+    session_id = response.json()['value']
+    
+    # The above code is implementing an infinite loop that iterates over a list of database machines.
+    # For each machine, it checks if the SQL server is running by calling the `check_sql_server()`
+    # function. If the server is running, it increments the `count` variable. The loop continues until
+    # all the machines in the list have been checked and the `count` variable is equal to the length
+    # of the list. The loop sleeps for 15 seconds between iterations.
+    while True:
+        for server in database_machines:
+            count = 0
+            if check_sql_server(server["ip_address"]):
+                count += 1
+        if count == database_machines.len():
+            break
+        time.sleep(15)
+
+    # The above code is using the VMware vSphere REST API to start virtual machines on a vCenter
+    # server. It loops through a list of server machines, gets the ID of the virtual machine
+    # associated with each server machine, and then sends a POST request to start the virtual machine.
+    for item in server_machines:
+        vm_url = f'{vcenter_server}/rest/vcenter/vm'
+        vm_data = {'filter.names': item["machine_name"]}
+        headers = {'Content-type': 'application/json', 'vmware-api-session-id': session_id}
+        response = requests.get(vm_url, params=vm_data, headers=headers)
+        vm_id = response.json()['value'][0]['vm']
+        # Start the virtual machine
+        power_url = f'{vcenter_server}/rest/vcenter/vm/{vm_id}/power/start'
+        power_data = {'spec': {}}
+        headers = {'Content-type': 'application/json', 'vmware-api-session-id': session_id}
+        response = requests.post(power_url, data=json.dumps(power_data), headers=headers)
 
 
 if __name__ == '__main__':
@@ -369,7 +425,9 @@ if __name__ == '__main__':
     deployment_template_id = get_deployment_template_id(deployment_template)
     machine_group_server_scan_id = scan_machine_group(machine_group_server_id, scan_template_id, credential_id)
     deployment_server_id = start_deployment(machine_group_server_scan_id, deployment_template_id)
-    wait_for_shutdown(deployment_server_id)
+    deployment_server_machines = get_patch_deployment_machines(deployment_server_id)
+    wait_for_shutdown(deployment_server_machines, deployment_server_id)
     machine_group_database_scan_id = scan_machine_group(machine_group_database_id, scan_template_id, credential_id)
     deployment_database_id = start_deployment(machine_group_database_scan_id, deployment_template_id)
-    wait_for_shutdown(deployment_database_id, True)
+    deployment_database_machines = get_patch_deployment_machines(deployment_database_id)
+    wait_for_shutdown(deployment_database_machines, deployment_database_id, True)
