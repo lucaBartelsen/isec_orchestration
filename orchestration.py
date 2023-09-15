@@ -156,7 +156,12 @@ def get_id_by_name(api_endpoint, name):
     :return: the id of an item with a specific name from a JSON response obtained from a specified API
     endpoint.
     """
-    url = f"{server}/st/console/api/v1.0/{api_endpoint}"
+    if api_endpoint == 'machinegroups':
+        url = f"{server}/st/console/api/v1.0/{api_endpoint}/?count=1000"
+    elif api_endpoint == 'credentials':
+        url = f"{server}/st/console/api/v1.0/{api_endpoint}/?name={name}"
+    else:
+        url = f"{server}/st/console/api/v1.0/{api_endpoint}"
 
     response = requests.get(url, auth=auth, verify=verify)
 
